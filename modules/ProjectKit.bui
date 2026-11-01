@@ -1,0 +1,1294 @@
+Import editorkit
+
+Private Function SameText(a As String, b As String) As Boolean
+    Return String.Compare(a, b, True) = 0
+End Function
+
+Private Sub RequireName(value As String, label As String)
+    If value = "" Or String.Len(value) > 512 Then Throw New InvalidArgumentException("Invalid " + label)
+    For Each ch As String In String.Chars(value)
+        If String.Asc(ch) < 32 Or String.Asc(ch) = 127 Then Throw New InvalidArgumentException("Control character in " + label)
+    Next
+End Sub
+
+Private Sub RequireId(value As String)
+    RequireName(value, "item id")
+    For Each ch As String In String.Chars(value)
+        Dim code As Integer = String.Asc(ch)
+        If Not ((code >= 65 And code <= 90) Or (code >= 97 And code <= 122) Or (code >= 48 And code <= 57) Or ch = "-" Or ch = "_") Then Throw New InvalidArgumentException("Item ids use ASCII letters, digits, hyphen and underscore")
+    Next
+End Sub
+
+Private Sub RequireRelativeName(value As String)
+    RequireName(value, "relative path")
+    If String.Contains(value, "\\") Or String.Contains(value, ":") Then Throw New InvalidArgumentException("Use a relative slash-separated project path")
+    For Each component As String In String.Split(value, "/")
+        If component = "" Or component = "." Or component = ".." Then Throw New InvalidArgumentException("Noncanonical project path")
+    Next
+End Sub
+
+Private Function ValidatedText(value As String) As String
+    Dim data As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    If data.Count > 8388608 Then Throw New InvalidArgumentException("Project item exceeds 8 MiB")
+    Return data.ToString(Text.Encodings.UTF8)
+End Function
+
+''' Immutable snapshot of one registered project item, including its unsaved content.
+Public Class ProjectItem
+    Private Property mId As String
+    Private Property mName As String
+    Private Property mKind As String
+    Private Property mText As String
+    Private Property mVersion As Integer
+    Private Property mDirty As Boolean
+
+    Internal Sub Constructor(itemId As String, relativeName As String, kind As String, content As String, revision As Integer, dirty As Boolean)
+        Me.mId = itemId
+        Me.mName = relativeName
+        Me.mKind = kind
+        Me.mText = content
+        Me.mVersion = revision
+        Me.mDirty = dirty
+    End Sub
+
+    Public Property Id As String
+        Get
+            Return Me.mId
+        End Get
+    End Property
+    Public Property RelativePath As String
+        Get
+            Return Me.mName
+        End Get
+    End Property
+    Public Property Kind As String
+        Get
+            Return Me.mKind
+        End Get
+    End Property
+    Public Property Text As String
+        Get
+            Return Me.mText
+        End Get
+    End Property
+    Public Property Version As Integer
+        Get
+            Return Me.mVersion
+        End Get
+    End Property
+    Public Property IsDirty As Boolean
+        Get
+            Return Me.mDirty
+        End Get
+    End Property
+    Public Property ResourceUri As String
+        Get
+            Return "buoy-project://item/" + Me.mId
+        End Get
+    End Property
+End Class
+
+Private Class ProjectHistoryGroup
+    Public Property Id As Integer
+    Public Property Members As Array Of String
+    Public Sub Constructor(id As Integer, members As Array Of String)
+        Me.Id = id
+        Me.Members = Array.Clone(members)
+    End Sub
+End Class
+
+Private Class ProjectHistoryFrame
+    Public Property Group As ProjectHistoryGroup
+    Public Property Text As String
+    Public Sub Constructor(group As ProjectHistoryGroup, text As String)
+        Me.Group = group
+        Me.Text = text
+    End Sub
+End Class
+
+Private Class ProjectEntry
+    Public Property ItemId As String
+    Public Property RelativeName As String
+    Public Property Kind As String
+    Public Property Content As String
+    Public Property Saved As String
+    Public Property Version As Integer = 1
+    Public Property UndoHistory As Array Of ProjectHistoryFrame = []
+    Public Property RedoHistory As Array Of ProjectHistoryFrame = []
+
+    Public Function Snapshot() As ProjectItem
+        Return New ProjectItem(Me.ItemId, Me.RelativeName, Me.Kind, Me.Content, Me.Version, Not SameText(Me.Content, Me.Saved))
+    End Function
+
+    Public Function CloneEntry() As ProjectEntry
+        Dim entry As New ProjectEntry()
+        entry.ItemId = Me.ItemId
+        entry.RelativeName = Me.RelativeName
+        entry.Kind = Me.Kind
+        entry.Content = Me.Content
+        entry.Saved = Me.Saved
+        entry.Version = Me.Version
+        entry.UndoHistory = Array.Clone(Me.UndoHistory)
+        entry.RedoHistory = Array.Clone(Me.RedoHistory)
+        Return entry
+    End Function
+
+    Public Function Changed(content As String, historyLimit As Integer, group As ProjectHistoryGroup) As ProjectEntry
+        Dim entry As ProjectEntry = Me.CloneEntry()
+        If SameText(content, Me.Content) Then Return entry
+        entry.Content = content
+        entry.Version += 1
+        If historyLimit > 0 Then Array.Append(entry.UndoHistory, New ProjectHistoryFrame(group, Me.Content))
+        Array.Clear(entry.RedoHistory)
+        Return entry
+    End Function
+
+End Class
+
+''' Byte ranges address the exact item revision specified here.
+Public Class ProjectChangeRequest
+    Private Property mId As String
+    Private Property mVersion As Integer
+    Private Property mEdits As Array Of EditorEdit
+
+    Public Sub Constructor(itemId As String, expectedVersion As Integer, edits As Array Of EditorEdit)
+        RequireId(itemId)
+        If expectedVersion < 1 Then Throw New InvalidArgumentException("Expected version must be positive")
+        Me.mId = itemId
+        Me.mVersion = expectedVersion
+        Me.mEdits = Array.Clone(edits)
+    End Sub
+
+    Public Property ItemId As String
+        Get
+            Return Me.mId
+        End Get
+    End Property
+    Public Property ExpectedVersion As Integer
+        Get
+            Return Me.mVersion
+        End Get
+    End Property
+    Public Property Edits As Array Of EditorEdit
+        Get
+            Return Array.Clone(Me.mEdits)
+        End Get
+    End Property
+End Class
+
+Public Class ProjectChange
+    Private Property mItemId As String
+    Private Property mVersion As Integer
+    Private Property mOld As String
+    Private Property mNew As String
+
+    Internal Sub Constructor(itemId As String, expectedVersion As Integer, oldText As String, newText As String)
+        Me.mItemId = itemId
+        Me.mVersion = expectedVersion
+        Me.mOld = oldText
+        Me.mNew = newText
+    End Sub
+    Public Property ItemId As String
+        Get
+            Return Me.mItemId
+        End Get
+    End Property
+    Public Property ExpectedVersion As Integer
+        Get
+            Return Me.mVersion
+        End Get
+    End Property
+    Public Property OldText As String
+        Get
+            Return Me.mOld
+        End Get
+    End Property
+    Public Property NewText As String
+        Get
+            Return Me.mNew
+        End Get
+    End Property
+End Class
+
+Public Enum ProjectProposalStatus As Integer
+    Pending = 0
+    Applied = 1
+    Rejected = 2
+End Enum
+
+Public Class ProjectProposal
+    Private Property mId As String
+    Private Property mStatus As ProjectProposalStatus = ProjectProposalStatus.Pending
+    Private Property mChanges As Array Of ProjectChange
+
+    Internal Sub Constructor(proposalId As String, changes As Array Of ProjectChange)
+        Me.mId = proposalId
+        Me.mChanges = Array.Clone(changes)
+    End Sub
+    Internal Sub SetStatus(status As ProjectProposalStatus)
+        Me.mStatus = status
+    End Sub
+    Public Property Id As String
+        Get
+            Return Me.mId
+        End Get
+    End Property
+    Public Property Status As ProjectProposalStatus
+        Get
+            Return Me.mStatus
+        End Get
+    End Property
+    Public Property Changes As Array Of ProjectChange
+        Get
+            Return Array.Clone(Me.mChanges)
+        End Get
+    End Property
+End Class
+
+''' One-thread in-memory project model. No filesystem or process side effects.
+Public Class ProjectWorkspace
+    Private Property mItems As Array Of ProjectEntry = []
+    Private Property mProposals As Array Of ProjectProposal = []
+    Private Property mNextProposal As Integer = 1
+    Private Property mHistoryLimit As Integer
+    Private Property mNextHistory As Integer = 1
+    ' Host-owned policy. No project tool can change it.
+    Public Property AutoAllowAgentEdits As Boolean = False
+    Private Property mAgentProposals As Array Of String = []
+
+    Public Sub Constructor(historyLimit As Integer = 100)
+        If historyLimit < 0 Or historyLimit > 1000 Then Throw New InvalidArgumentException("History limit must be 0..1000")
+        Me.mHistoryLimit = historyLimit
+    End Sub
+
+    Private Function IndexFor(itemId As String) As Integer
+        For i As Integer = 0 To Array.Count(Me.mItems) - 1
+            If SameText(Me.mItems(i).ItemId, itemId) Then Return i
+        Next
+        Throw New InvalidArgumentException("Unknown project item: " + itemId)
+    End Function
+
+    Private Function ProposalIndex(proposalId As String) As Integer
+        For i As Integer = 0 To Array.Count(Me.mProposals) - 1
+            If SameText(Me.mProposals(i).Id, proposalId) Then Return i
+        Next
+        Throw New InvalidArgumentException("Unknown edit proposal")
+    End Function
+
+    Public Sub RegisterItem(itemId As String, relativeName As String, kind As String, content As String)
+        RequireId(itemId)
+        RequireRelativeName(relativeName)
+        RequireName(kind, "item kind")
+        If Array.Count(Me.mItems) >= 4096 Then Throw New InvalidArgumentException("Project item limit reached")
+        For Each entry As ProjectEntry In Me.mItems
+            If SameText(entry.ItemId, itemId) Or SameText(entry.RelativeName, relativeName) Then Throw New InvalidArgumentException("Duplicate project item id or path")
+        Next
+        Dim entry As New ProjectEntry()
+        entry.ItemId = itemId
+        entry.RelativeName = relativeName
+        entry.Kind = kind
+        entry.Content = ValidatedText(content)
+        entry.Saved = entry.Content
+        Array.Append(Me.mItems, entry)
+    End Sub
+
+    Public Function Items() As Array Of ProjectItem
+        Dim items As Array Of ProjectItem = []
+        For Each entry As ProjectEntry In Me.mItems
+            Array.Append(items, entry.Snapshot())
+        Next
+        Return items
+    End Function
+
+    Public Function ReadItem(itemId As String) As ProjectItem
+        Return Me.mItems(Me.IndexFor(itemId)).Snapshot()
+    End Function
+
+    Public Function ApplyHostEdits(itemId As String, expectedVersion As Integer, edits As Array Of EditorEdit) As Boolean
+        Dim index As Integer = Me.IndexFor(itemId)
+        Dim entry As ProjectEntry = Me.mItems(index)
+        If entry.Version <> expectedVersion Then Throw New InvalidArgumentException("Project item revision changed")
+        Dim candidate As New EditorDocument(entry.Content, 0)
+        candidate.ApplyEdits(edits)
+        Dim content As String = ValidatedText(candidate.Text)
+        If SameText(content, entry.Content) Then Return False
+        Dim members As Array Of String = [itemId]
+        Dim group As New ProjectHistoryGroup(Me.mNextHistory, members)
+        Dim entries As Array Of ProjectEntry = Me.ClearRedoConnected(Array.Clone(Me.mItems), members)
+        entries(index) = entries(index).Changed(content, Me.mHistoryLimit, group)
+        Me.TrimHistory(entries)
+        Me.mItems = entries
+        Me.mNextHistory += 1
+        Return True
+    End Function
+
+    Public Function ReplaceText(itemId As String, expectedVersion As Integer, content As String) As Boolean
+        Dim item As ProjectItem = Me.ReadItem(itemId)
+        Dim edits As Array Of EditorEdit = [New EditorEdit(0, Bytes.FromString(item.Text, Text.Encodings.UTF8).Count, content)]
+        Return Me.ApplyHostEdits(itemId, expectedVersion, edits)
+    End Function
+
+    ''' Renames an item in place (file rename/move). Id, text, saved baseline, version
+    ''' and undo/redo history are kept, so the item's history survives the move.
+    Public Sub RenameItem(itemId As String, relativeName As String)
+        RequireRelativeName(relativeName)
+        Dim index As Integer = Me.IndexFor(itemId)
+        For i As Integer = 0 To Array.Count(Me.mItems) - 1
+            If i <> index And SameText(Me.mItems(i).RelativeName, relativeName) Then Throw New InvalidArgumentException("Duplicate project item id or path")
+        Next
+        Dim entry As ProjectEntry = Me.mItems(index).CloneEntry()
+        entry.RelativeName = relativeName
+        Dim entries As Array Of ProjectEntry = Array.Clone(Me.mItems)
+        entries(index) = entry
+        Me.mItems = entries
+    End Sub
+
+    ''' Replaces an item's text and saved baseline after the host itself rewrote the file
+    ''' on disk (for example a file rename updating imports). No history frame is
+    ''' recorded. The item's undo/redo history is forgotten, because older frames would
+    ''' bring back the pre-rewrite text, and so is every multi-item transaction it took
+    ''' part in (with the older history of those other members), so no partial group
+    ''' remains usable.
+    Public Sub ReloadItem(itemId As String, content As String)
+        Dim index As Integer = Me.IndexFor(itemId)
+        Dim text As String = ValidatedText(content)
+        Dim members As Array Of String = []
+        members.Append(itemId)
+        Dim entries As Array Of ProjectEntry = Me.ClearRedoConnected(Array.Clone(Me.mItems), members)
+        Dim pending As Array Of ProjectHistoryGroup = []
+        Dim seen As New Set Of Integer()
+        For Each frame As ProjectHistoryFrame In entries(index).UndoHistory
+            If Not seen.Contains(frame.Group.Id) Then
+                seen.Add(frame.Group.Id)
+                pending.Append(frame.Group)
+            End If
+        Next
+        Dim cursor As Integer = 0
+        While cursor < Array.Count(pending)
+            Dim group As ProjectHistoryGroup = pending(cursor)
+            cursor += 1
+            For Each member As String In group.Members
+                Dim memberIndex As Integer = Me.IndexFor(member)
+                Dim entry As ProjectEntry = entries(memberIndex)
+                Dim boundary As Integer = -1
+                For i As Integer = 0 To Array.Count(entry.UndoHistory) - 1
+                    If entry.UndoHistory(i).Group.Id = group.Id Then boundary = i
+                Next
+                If boundary < 0 Then Continue For
+                Dim fresh As ProjectEntry = entry.CloneEntry()
+                For i As Integer = 0 To boundary
+                    Dim lost As ProjectHistoryGroup = fresh.UndoHistory(i).Group
+                    If Not seen.Contains(lost.Id) Then
+                        seen.Add(lost.Id)
+                        pending.Append(lost)
+                    End If
+                Next
+                Dim retained As Array Of ProjectHistoryFrame = []
+                For i As Integer = boundary + 1 To Array.Count(fresh.UndoHistory) - 1
+                    retained.Append(fresh.UndoHistory(i))
+                Next
+                fresh.UndoHistory = retained
+                entries(memberIndex) = fresh
+            Next
+        End While
+        Dim reloaded As ProjectEntry = entries(index).CloneEntry()
+        reloaded.Content = text
+        reloaded.Saved = text
+        reloaded.Version += 1
+        reloaded.UndoHistory = []
+        reloaded.RedoHistory = []
+        entries(index) = reloaded
+        Me.mItems = entries
+    End Sub
+
+    ''' Removes a clean item after a host filesystem deletion. Its connected history
+    ''' groups are pruned, while independent undo/redo and surviving revisions stay intact.
+    ''' Pending proposals touching the removed identity are rejected, all such retained
+    ''' proposals are forgotten, and their notifications are dropped from the agent queue.
+    Public Sub RemoveItem(itemId As String)
+        Dim index As Integer = Me.IndexFor(itemId)
+        Dim removed As ProjectEntry = Me.mItems(index)
+        If Not SameText(removed.Content, removed.Saved) Then Throw New InvalidArgumentException("Save or discard the item before removing it")
+        Dim retired As Array Of ProjectProposal = []
+        Dim retained As Array Of ProjectProposal = []
+        Dim forgotten As New Set Of String()
+        For Each proposal As ProjectProposal In Me.mProposals
+            Dim touches As Boolean = False
+            For Each change As ProjectChange In proposal.Changes
+                If SameText(change.ItemId, itemId) Then touches = True
+            Next
+            If touches Then
+                retired.Append(proposal)
+                forgotten.Add(proposal.Id)
+            Else
+                retained.Append(proposal)
+            End If
+        Next
+        Dim notifications As Array Of String = []
+        For Each proposalId As String In Me.mAgentProposals
+            If Not forgotten.Contains(proposalId) Then notifications.Append(proposalId)
+        Next
+        ' ReloadItem already handles transitive group pruning in both history directions.
+        ' Do it while every identity still exists, before detaching the entry itself.
+        Me.ReloadItem(itemId, removed.Content)
+        Dim entries As Array Of ProjectEntry = Array.Clone(Me.mItems)
+        Array.RemoveAt(entries, index)
+        For Each proposal As ProjectProposal In retired
+            If proposal.Status = ProjectProposalStatus.Pending Then proposal.SetStatus(ProjectProposalStatus.Rejected)
+        Next
+        Me.mItems = entries
+        Me.mProposals = retained
+        Me.mAgentProposals = notifications
+    End Sub
+
+    Public Sub MarkSaved(itemId As String)
+        Dim index As Integer = Me.IndexFor(itemId)
+        Dim entry As ProjectEntry = Me.mItems(index).CloneEntry()
+        entry.Saved = entry.Content
+        Dim entries As Array Of ProjectEntry = Array.Clone(Me.mItems)
+        entries(index) = entry
+        Me.mItems = entries
+    End Sub
+
+    ' Clearing one redo branch must clear every connected transaction branch:
+    ' keeping a later frame after its prerequisite vanished would skip edits.
+    Private Function ClearRedoConnected(entries As Array Of ProjectEntry, members As Array Of String) As Array Of ProjectEntry
+        Dim pending As Array Of ProjectHistoryGroup = []
+        Dim seen As New Set Of Integer()
+        For Each member As String In members
+            Dim index As Integer = Me.IndexFor(member)
+            Dim entry As ProjectEntry = entries(index).CloneEntry()
+            For Each frame As ProjectHistoryFrame In entry.RedoHistory
+                If Not seen.Contains(frame.Group.Id) Then
+                    seen.Add(frame.Group.Id)
+                    pending.Append(frame.Group)
+                End If
+            Next
+            entry.RedoHistory = []
+            entries(index) = entry
+        Next
+        Dim cursor As Integer = 0
+        While cursor < Array.Count(pending)
+            Dim group As ProjectHistoryGroup = pending(cursor)
+            cursor += 1
+            For Each member As String In group.Members
+                Dim index As Integer = Me.IndexFor(member)
+                Dim entry As ProjectEntry = entries(index)
+                If Array.Count(entry.RedoHistory) = 0 Then Continue For
+                Dim fresh As ProjectEntry = entry.CloneEntry()
+                For Each frame As ProjectHistoryFrame In fresh.RedoHistory
+                    If Not seen.Contains(frame.Group.Id) Then
+                        seen.Add(frame.Group.Id)
+                        pending.Append(frame.Group)
+                    End If
+                Next
+                fresh.RedoHistory = []
+                entries(index) = fresh
+            Next
+        End While
+        Return entries
+    End Function
+
+    ' If a member forgets a transaction at the history bound, forget that group
+    ' and the older prefix in every participant. No partial group remains usable.
+    Private Sub TrimHistory(entries As Array Of ProjectEntry)
+        Dim pending As Array Of ProjectHistoryGroup = []
+        Dim seen As New Set Of Integer()
+        For Each entry As ProjectEntry In entries
+            Dim excess As Integer = Array.Count(entry.UndoHistory) - Me.mHistoryLimit
+            For i As Integer = 0 To excess - 1
+                Dim group As ProjectHistoryGroup = entry.UndoHistory(i).Group
+                If Not seen.Contains(group.Id) Then
+                    seen.Add(group.Id)
+                    pending.Append(group)
+                End If
+            Next
+        Next
+        Dim cursor As Integer = 0
+        While cursor < Array.Count(pending)
+            Dim group As ProjectHistoryGroup = pending(cursor)
+            cursor += 1
+            For Each member As String In group.Members
+                Dim index As Integer = Me.IndexFor(member)
+                Dim entry As ProjectEntry = entries(index)
+                Dim boundary As Integer = -1
+                For i As Integer = 0 To Array.Count(entry.UndoHistory) - 1
+                    If entry.UndoHistory(i).Group.Id = group.Id Then boundary = i
+                Next
+                If boundary < 0 Then Continue For
+                Dim fresh As ProjectEntry = entry.CloneEntry()
+                For i As Integer = 0 To boundary
+                    Dim lost As ProjectHistoryGroup = fresh.UndoHistory(i).Group
+                    If Not seen.Contains(lost.Id) Then
+                        seen.Add(lost.Id)
+                        pending.Append(lost)
+                    End If
+                Next
+                Dim retained As Array Of ProjectHistoryFrame = []
+                For i As Integer = boundary + 1 To Array.Count(fresh.UndoHistory) - 1
+                    retained.Append(fresh.UndoHistory(i))
+                Next
+                fresh.UndoHistory = retained
+                entries(index) = fresh
+            Next
+        End While
+    End Sub
+
+    ''' Whether the next history step can move without crossing another item's edit.
+    ''' These queries never change revisions, text, or history.
+    Public Function CanUndo(itemId As String) As Boolean
+        Return Me.HistoryAvailable(itemId, False)
+    End Function
+
+    Public Function CanRedo(itemId As String) As Boolean
+        Return Me.HistoryAvailable(itemId, True)
+    End Function
+
+    Private Function HistoryAvailable(itemId As String, forward As Boolean) As Boolean
+        Dim selected As ProjectEntry = Me.mItems(Me.IndexFor(itemId))
+        Dim stack As Array Of ProjectHistoryFrame = selected.UndoHistory
+        If forward Then stack = selected.RedoHistory
+        If Array.Count(stack) = 0 Then Return False
+        Dim group As ProjectHistoryGroup = Array.Last(stack).Group
+        For Each member As String In group.Members
+            Dim entry As ProjectEntry = Me.mItems(Me.IndexFor(member))
+            Dim memberStack As Array Of ProjectHistoryFrame = entry.UndoHistory
+            If forward Then memberStack = entry.RedoHistory
+            If Array.Count(memberStack) = 0 Then Return False
+            If Array.Last(memberStack).Group.Id <> group.Id Then Return False
+        Next
+        Return True
+    End Function
+
+    Public Function Undo(itemId As String) As Boolean
+        Return Me.MoveHistory(itemId, False)
+    End Function
+
+    Public Function Redo(itemId As String) As Boolean
+        Return Me.MoveHistory(itemId, True)
+    End Function
+
+    Private Function MoveHistory(itemId As String, forward As Boolean) As Boolean
+        Dim selected As ProjectEntry = Me.mItems(Me.IndexFor(itemId))
+        Dim stack As Array Of ProjectHistoryFrame = selected.UndoHistory
+        If forward Then stack = selected.RedoHistory
+        If Array.Count(stack) = 0 Then Return False
+        Dim group As ProjectHistoryGroup = Array.Last(stack).Group
+        ' Check all identities before constructing any changed state. Text equality
+        ' cannot prove history identity: independent edits may recreate old bytes.
+        For Each member As String In group.Members
+            Dim entry As ProjectEntry = Me.mItems(Me.IndexFor(member))
+            Dim memberStack As Array Of ProjectHistoryFrame = entry.UndoHistory
+            If forward Then memberStack = entry.RedoHistory
+            Dim available As Boolean = Array.Count(memberStack) > 0
+            If available Then available = Array.Last(memberStack).Group.Id = group.Id
+            If Not available Then Throw New InvalidArgumentException("Project transaction history is blocked by another change in " + entry.RelativeName)
+        Next
+        Dim entries As Array Of ProjectEntry = Array.Clone(Me.mItems)
+        For Each member As String In group.Members
+            Dim index As Integer = Me.IndexFor(member)
+            Dim entry As ProjectEntry = Me.mItems(index)
+            Dim fresh As ProjectEntry = entry.CloneEntry()
+            If forward Then
+                fresh.Content = Array.Last(fresh.RedoHistory).Text
+                Array.RemoveAt(fresh.RedoHistory, Array.Count(fresh.RedoHistory) - 1)
+                fresh.UndoHistory.Append(New ProjectHistoryFrame(group, entry.Content))
+            Else
+                fresh.Content = Array.Last(fresh.UndoHistory).Text
+                Array.RemoveAt(fresh.UndoHistory, Array.Count(fresh.UndoHistory) - 1)
+                fresh.RedoHistory.Append(New ProjectHistoryFrame(group, entry.Content))
+            End If
+            fresh.Version += 1
+            entries(index) = fresh
+        Next
+        Me.mItems = entries
+        Return True
+    End Function
+
+    Public Function Propose(requests As Array Of ProjectChangeRequest) As ProjectProposal
+        If Array.Count(requests) = 0 Or Array.Count(requests) > 256 Then Throw New InvalidArgumentException("A proposal requires 1..256 changed items")
+        If Array.Count(Me.mProposals) >= 256 Then Throw New InvalidArgumentException("Retained proposal limit reached")
+        Dim changes As Array Of ProjectChange = []
+        For Each request As ProjectChangeRequest In requests
+            If request = Nil Then Throw New InvalidArgumentException("Nil change request")
+            For Each change As ProjectChange In changes
+                If SameText(change.ItemId, request.ItemId) Then Throw New InvalidArgumentException("Duplicate item in proposal")
+            Next
+            Dim entry As ProjectEntry = Me.mItems(Me.IndexFor(request.ItemId))
+            If entry.Version <> request.ExpectedVersion Then Throw New InvalidArgumentException("Project item revision changed")
+            Dim candidate As New EditorDocument(entry.Content, 0)
+            candidate.ApplyEdits(request.Edits)
+            Array.Append(changes, New ProjectChange(entry.ItemId, entry.Version, entry.Content, ValidatedText(candidate.Text)))
+        Next
+        Dim proposal As New ProjectProposal("proposal-" + String.From(Me.mNextProposal), changes)
+        Array.Append(Me.mProposals, proposal)
+        Me.mNextProposal += 1
+        Return proposal
+    End Function
+
+    ''' Agent edits share the exact atomic, revision-checked undo group used by manual approval.
+    Public Function ProposeAgentEdits(requests As Array Of ProjectChangeRequest) As ProjectProposal
+        If Me.AutoAllowAgentEdits And Me.mHistoryLimit = 0 Then Throw New InvalidArgumentException("Agent auto-allow requires undo history; enable history or review edits manually")
+        Dim proposal As ProjectProposal = Me.Propose(requests)
+        If Me.AutoAllowAgentEdits Then Me.ApproveProposal(proposal.Id)
+        Me.mAgentProposals.Append(proposal.Id)
+        Return proposal
+    End Function
+
+    Public Function TakeAgentProposals() As Array Of String
+        Dim proposals As Array Of String = Me.mAgentProposals
+        Me.mAgentProposals = []
+        Return proposals
+    End Function
+
+    Public Function ReadProposal(proposalId As String) As ProjectProposal
+        Return Me.mProposals(Me.ProposalIndex(proposalId))
+    End Function
+
+    ''' Host-only approval. Builds all replacement states before a single atomic state swap.
+    Public Sub ApproveProposal(proposalId As String)
+        Dim proposal As ProjectProposal = Me.ReadProposal(proposalId)
+        If proposal.Status <> ProjectProposalStatus.Pending Then Throw New InvalidArgumentException("Proposal is no longer pending")
+        Dim members As Array Of String = []
+        For Each change As ProjectChange In proposal.Changes
+            Dim entry As ProjectEntry = Me.mItems(Me.IndexFor(change.ItemId))
+            If entry.Version <> change.ExpectedVersion Then Throw New InvalidArgumentException("Project item revision changed; proposal remains pending")
+            If Not SameText(entry.Content, change.NewText) Then members.Append(change.ItemId)
+        Next
+        If Array.Count(members) > 0 Then
+            Dim group As New ProjectHistoryGroup(Me.mNextHistory, members)
+            Dim entries As Array Of ProjectEntry = Me.ClearRedoConnected(Array.Clone(Me.mItems), members)
+            For Each change As ProjectChange In proposal.Changes
+                Dim index As Integer = Me.IndexFor(change.ItemId)
+                Dim entry As ProjectEntry = entries(index)
+                If Not SameText(entry.Content, change.NewText) Then entries(index) = entry.Changed(change.NewText, Me.mHistoryLimit, group)
+            Next
+            Me.TrimHistory(entries)
+            Me.mItems = entries
+            Me.mNextHistory += 1
+        End If
+        proposal.SetStatus(ProjectProposalStatus.Applied)
+    End Sub
+
+    Public Sub RejectProposal(proposalId As String)
+        Dim proposal As ProjectProposal = Me.ReadProposal(proposalId)
+        If proposal.Status <> ProjectProposalStatus.Pending Then Throw New InvalidArgumentException("Proposal is no longer pending")
+        proposal.SetStatus(ProjectProposalStatus.Rejected)
+    End Sub
+
+    Public Sub ForgetProposal(proposalId As String)
+        Dim index As Integer = Me.ProposalIndex(proposalId)
+        If Me.mProposals(index).Status = ProjectProposalStatus.Pending Then Throw New InvalidArgumentException("Reject or approve a proposal before forgetting it")
+        Dim notifications As Array Of String = []
+        For Each queuedId As String In Me.mAgentProposals
+            If Not SameText(queuedId, proposalId) Then notifications.Append(queuedId)
+        Next
+        Array.RemoveAt(Me.mProposals, index)
+        Me.mAgentProposals = notifications
+    End Sub
+End Class
+
+Private Function NumberJSON(value As Integer) As JSONItem
+    Dim numeric As Double = value
+    Return JSONItem.From(numeric)
+End Function
+
+Private Function ItemJSON(item As ProjectItem, includeText As Boolean) As JSONItem
+    Dim value As JSONItem = JSONItem.NewObject()
+    value.Value("id") = item.Id
+    value.Value("path") = item.RelativePath
+    value.Value("kind") = item.Kind
+    value.Value("version") = NumberJSON(item.Version)
+    value.Value("dirty") = item.IsDirty
+    value.Value("uri") = item.ResourceUri
+    If includeText Then value.Value("text") = item.Text
+    Return value
+End Function
+
+Public Function ProposalJSON(proposal As ProjectProposal) As JSONItem
+    If proposal = Nil Then Throw New InvalidArgumentException("Proposal is required")
+    Dim value As JSONItem = JSONItem.NewObject()
+    value.Value("id") = proposal.Id
+    Select Case proposal.Status
+        Case ProjectProposalStatus.Pending
+            value.Value("status") = "pending"
+        Case ProjectProposalStatus.Applied
+            value.Value("status") = "applied"
+        Case ProjectProposalStatus.Rejected
+            value.Value("status") = "rejected"
+    End Select
+    Dim changes As JSONItem = JSONItem.NewArray()
+    For Each change As ProjectChange In proposal.Changes
+        Dim item As JSONItem = JSONItem.NewObject()
+        item.Value("itemId") = change.ItemId
+        item.Value("expectedVersion") = NumberJSON(change.ExpectedVersion)
+        item.Value("oldText") = change.OldText
+        item.Value("newText") = change.NewText
+        changes.Add(item)
+    Next
+    value.Value("changes") = changes
+    Return value
+End Function
+
+Private Sub RequireKeys(value As JSONItem, allowed As Array Of String)
+    If value = Nil Then Throw New InvalidArgumentException("Object is required")
+    If Not value.IsObject() Then Throw New InvalidArgumentException("Object is required")
+    For Each key As String In value.Keys()
+        Dim recognized As Boolean = False
+        For Each permitted As String In allowed
+            If SameText(key, permitted) Then recognized = True
+        Next
+        If Not recognized Then Throw New InvalidArgumentException("Unknown property: " + key)
+    Next
+End Sub
+
+Private Function ReadString(value As JSONItem, key As String) As String
+    Dim field As JSONItem = value.Value(key)
+    If Not field.IsString() Then Throw New InvalidArgumentException("Expected string: " + key)
+    Return field.AsString().Value
+End Function
+
+Private Function ReadInteger(value As JSONItem, key As String) As Integer
+    Dim field As JSONItem = value.Value(key)
+    If Not field.IsNumber() Then Throw New InvalidArgumentException("Expected integer: " + key)
+    Dim numeric As Double = field.AsNumber().Value
+    If numeric < 0.0 Or numeric > 9007199254740991.0 Or numeric <> Math.Floor(numeric) Then Throw New InvalidArgumentException("Expected nonnegative safe integer: " + key)
+    Return numeric
+End Function
+
+Private Function ValidRequestId(value As JSONItem) As Boolean
+    If value.IsString() Then Return True
+    If Not value.IsNumber() Then Return False
+    Dim numeric As Double = value.AsNumber().Value
+    Return numeric >= -9007199254740991.0 And numeric <= 9007199254740991.0 And numeric = Math.Floor(numeric)
+End Function
+
+Private Function Reply(requestId As JSONItem, payload As JSONItem) As JSONItem
+    Dim envelope As JSONItem = JSONItem.NewObject()
+    envelope.Value("jsonrpc") = "2.0"
+    envelope.Value("id") = requestId
+    envelope.Value("result") = payload
+    Return envelope
+End Function
+
+Private Function Failure(requestId As JSONItem, code As Integer, message As String) As JSONItem
+    Dim envelope As JSONItem = JSONItem.NewObject()
+    envelope.Value("jsonrpc") = "2.0"
+    envelope.Value("id") = requestId
+    Dim detail As JSONItem = JSONItem.NewObject()
+    detail.Value("code") = NumberJSON(code)
+    detail.Value("message") = message
+    envelope.Value("error") = detail
+    Return envelope
+End Function
+
+Private Function ToolContent(payload As JSONItem, failed As Boolean) As JSONItem
+    Dim value As JSONItem = JSONItem.NewObject()
+    Dim blocks As JSONItem = JSONItem.NewArray()
+    Dim contentBlock As JSONItem = JSONItem.NewObject()
+    contentBlock.Value("type") = "text"
+    contentBlock.Value("text") = Json.Stringify(payload)
+    blocks.Add(contentBlock)
+    value.Value("content") = blocks
+    value.Value("isError") = failed
+    Return value
+End Function
+
+Private Function BoundedInteger(value As JSONItem, key As String, fallback As Integer, minimum As Integer, maximum As Integer) As Integer
+    If Not value.HasKey(key) Then Return fallback
+    Dim number As Integer = ReadInteger(value, key)
+    If number < minimum Or number > maximum Then Throw New InvalidArgumentException(key + " is outside the supported range")
+    Return number
+End Function
+
+Private Function UTF8Prefix(value As String, maximum As Integer) As String
+    Dim data As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    If data.Count <= maximum Then Return value
+    Dim count As Integer = maximum
+    While count > 0
+        If (data.Item(count) And 192) <> 128 Then Exit While
+        count -= 1
+    End While
+    Return String.LeftBytes(value, count)
+End Function
+
+Private Function RangedItemJSON(item As ProjectItem, startLine As Integer, maxLines As Integer) As JSONItem
+    Dim payload As JSONItem = ItemJSON(item, False)
+    Dim lines As Array Of String = String.Split(item.Text, "\n")
+    Dim first As Integer = Math.Min(startLine - 1, Array.Count(lines))
+    Dim startByte As Integer = 0
+    For i As Integer = 0 To first - 1
+        startByte += String.LenBytes(lines(i))
+        If i < Array.Count(lines) - 1 Then startByte += 1
+    Next
+    Dim text As String = ""
+    Dim returnedLines As Integer = 0
+    Dim truncated As Boolean = False
+    For i As Integer = first To Math.Min(Array.Count(lines) - 1, first + maxLines - 1)
+        Dim line As String = lines(i)
+        If i < Array.Count(lines) - 1 Then line += "\n"
+        Dim room As Integer = 262144 - String.LenBytes(text)
+        If String.LenBytes(line) > room Then
+            text += UTF8Prefix(line, room)
+            returnedLines += 1
+            truncated = True
+            Exit For
+        End If
+        text += line
+        returnedLines += 1
+    Next
+    Dim endByte As Integer = startByte + String.LenBytes(text)
+    payload.Value("text") = text
+    payload.Value("startLine") = NumberJSON(startLine)
+    payload.Value("endLine") = NumberJSON(startLine + returnedLines - 1)
+    payload.Value("totalLines") = NumberJSON(Array.Count(lines))
+    payload.Value("startByte") = NumberJSON(startByte)
+    payload.Value("endByte") = NumberJSON(endByte)
+    payload.Value("offsetEncoding") = "utf-8"
+    payload.Value("truncated") = truncated Or endByte < String.LenBytes(item.Text)
+    Return payload
+End Function
+
+''' Host-provided tools may read additional trusted context; the extension owns its schemas.
+Public Interface ProjectToolExtension
+    Function Tools() As JSONItem
+    Function Call(name As String, input As JSONItem) As JSONItem
+End Interface
+
+''' Optional, idempotent lifecycle for extensions owning jobs or other active resources.
+Public Interface ProjectToolLifecycle
+    Sub Shutdown()
+End Interface
+
+''' Host-owned tool and resource switches; enforced on discovery and dispatch.
+Public Class ProjectToolAccess
+    Public Property DisabledTools As Set Of String = New Set Of String()
+    Public Property ResourcesEnabled As Boolean = True
+
+    Public Function Allows(name As String) As Boolean
+        Return Not Me.DisabledTools.Contains(String.LCase(name))
+    End Function
+End Class
+
+''' Stateful MCP request handler. The application supplies byte transport and host approval UI.
+Public Class ProjectMCPHost
+    Public Property Access As ProjectToolAccess = New ProjectToolAccess()
+    Private Property mWorkspace As ProjectWorkspace
+    Public Property Extension As ProjectToolExtension
+    Private Property mStage As Integer = 0
+    Private Property mProtocol As String = "2025-11-25"
+
+    Public Sub Constructor(workspace As ProjectWorkspace)
+        If workspace = Nil Then Throw New InvalidArgumentException("Workspace is required")
+        Me.mWorkspace = workspace
+    End Sub
+
+    Public Sub Shutdown()
+        Dim tools As ProjectToolExtension = Me.Extension
+        Me.Extension = Nil
+        If tools IsA ProjectToolLifecycle Then
+            Dim lifecycle As ProjectToolLifecycle = CType(tools, ProjectToolLifecycle)
+            lifecycle.Shutdown()
+        End If
+    End Sub
+
+    Private Function WorkspaceJSON() As JSONItem
+        Dim items As Array Of ProjectItem = Me.mWorkspace.Items()
+        Dim dirty As Integer = 0
+        For Each item As ProjectItem In items
+            If item.IsDirty Then dirty += 1
+        Next
+        Dim payload As JSONItem = JSONItem.NewObject()
+        payload.Value("itemCount") = NumberJSON(Array.Count(items))
+        payload.Value("dirtyCount") = NumberJSON(dirty)
+        payload.Value("authority") = "registered-buffers"
+        payload.Value("mutation") = "proposal"
+        payload.Value("autoAllowAgentEdits") = Me.mWorkspace.AutoAllowAgentEdits
+        payload.Value("editsEnabled") = Me.Access.Allows("project_propose_edits")
+        payload.Value("resourcesEnabled") = Me.Access.ResourcesEnabled
+        payload.Value("saves") = "unavailable"
+        payload.Value("execution") = "unavailable"
+        Return payload
+    End Function
+
+    Private Function ProposalSummary(proposal As ProjectProposal) As JSONItem
+        Dim payload As JSONItem = JSONItem.NewObject()
+        payload.Value("id") = proposal.Id
+        Dim status As String = "pending"
+        If proposal.Status = ProjectProposalStatus.Applied Then status = "applied"
+        If proposal.Status = ProjectProposalStatus.Rejected Then status = "rejected"
+        Dim changes As JSONItem = JSONItem.NewArray()
+        Dim allChanges As Array Of ProjectChange = proposal.Changes
+        ' Staleness describes a pending proposal; it never changes the host-owned enum.
+        If proposal.Status = ProjectProposalStatus.Pending Then
+            For Each change As ProjectChange In allChanges
+                If Me.mWorkspace.ReadItem(change.ItemId).Version <> change.ExpectedVersion Then status = "stale"
+            Next
+        End If
+        payload.Value("status") = status
+        payload.Value("changeCount") = NumberJSON(Array.Count(allChanges))
+        payload.Value("returnedChanges") = NumberJSON(0)
+        payload.Value("truncated") = False
+        payload.Value("changes") = changes
+        For Each change As ProjectChange In allChanges
+            Dim current As ProjectItem = Me.mWorkspace.ReadItem(change.ItemId)
+            Dim entry As JSONItem = JSONItem.NewObject()
+            entry.Value("itemId") = change.ItemId
+            entry.Value("path") = current.RelativePath
+            entry.Value("expectedVersion") = NumberJSON(change.ExpectedVersion)
+            entry.Value("currentVersion") = NumberJSON(current.Version)
+            entry.Value("oldBytes") = NumberJSON(String.LenBytes(change.OldText))
+            entry.Value("newBytes") = NumberJSON(String.LenBytes(change.NewText))
+            If proposal.Status = ProjectProposalStatus.Applied Then
+                Dim resultingVersion As Integer = change.ExpectedVersion
+                If Not SameText(change.OldText, change.NewText) Then resultingVersion += 1
+                entry.Value("resultingVersion") = NumberJSON(resultingVersion)
+            End If
+            Dim candidate As JSONItem = Json.Parse(Json.Stringify(changes))
+            candidate.Add(entry)
+            payload.Value("changes") = candidate
+            payload.Value("returnedChanges") = NumberJSON(candidate.Count())
+            ' Bound the actual MCP content wrapper, including nested JSON escaping.
+            If String.LenBytes(Json.Stringify(ToolContent(payload, False))) > 60000 Then
+                payload.Value("changes") = changes
+                payload.Value("returnedChanges") = NumberJSON(changes.Count())
+                payload.Value("truncated") = True
+                Exit For
+            End If
+            changes = candidate
+        Next
+        Return payload
+    End Function
+
+    Private Function ExtensionTools() As JSONItem
+        If Me.Extension = Nil Then Return JSONItem.NewArray()
+        Dim descriptors As JSONItem = Me.Extension.Tools()
+        If Not descriptors.IsArray() Or descriptors.Count() > 64 Then Throw New InvalidArgumentException("Extension tools must be an array of at most 64 descriptors")
+        Dim seen As New Set Of String()
+        For Each coreName As String In ["project_list_items", "project_read_item", "project_search", "project_propose_edits", "project_workspace", "project_proposal_status"]
+            seen.Add(coreName)
+        Next
+        For i As Integer = 0 To descriptors.Count() - 1
+            Dim descriptor As JSONItem = descriptors.ValueAt(i)
+            If Not descriptor.IsObject() Then Throw New InvalidArgumentException("Extension tool descriptor must be an object")
+            Dim name As String = ReadString(descriptor, "name")
+            RequireName(name, "extension tool name")
+            If Not descriptor.Value("inputSchema").IsObject() Then Throw New InvalidArgumentException("Extension tool schema must be an object")
+            If seen.Contains(name) Then Throw New InvalidArgumentException("Duplicate extension tool name")
+            seen.Add(name)
+        Next
+        Return descriptors
+    End Function
+
+    Private Function Search(input As JSONItem) As JSONItem
+        RequireKeys(input, ["query", "caseSensitive", "itemIds", "maxResults"])
+        Dim query As String = ReadString(input, "query")
+        If String.LenBytes(query) < 1 Or String.LenBytes(query) > 1024 Then Throw New InvalidArgumentException("query must contain 1..1024 UTF-8 bytes")
+        For Each character As String In String.Chars(query)
+            If String.Asc(character) = 0 Or character = "\n" Or character = "\r" Then Throw New InvalidArgumentException("query must be a single line without NUL")
+        Next
+        Dim caseSensitive As Boolean = False
+        If input.HasKey("caseSensitive") Then
+            If Not input.Value("caseSensitive").IsBoolean() Then Throw New InvalidArgumentException("caseSensitive must be a boolean")
+            caseSensitive = input.Value("caseSensitive").AsBoolean().Value
+        End If
+        Dim maximum As Integer = BoundedInteger(input, "maxResults", 20, 1, 100)
+        Dim selected As Array Of ProjectItem = []
+        If input.HasKey("itemIds") Then
+            Dim ids As JSONItem = input.Value("itemIds")
+            If Not ids.IsArray() Or ids.Count() > 256 Then Throw New InvalidArgumentException("itemIds must contain at most 256 registered IDs")
+            Dim seen As New Set Of String()
+            For i As Integer = 0 To ids.Count() - 1
+                If Not ids.ValueAt(i).IsString() Then Throw New InvalidArgumentException("itemIds must contain strings")
+                Dim itemId As String = ids.ValueAt(i).AsString().Value
+                RequireId(itemId)
+                If seen.Contains(itemId) Then Throw New InvalidArgumentException("itemIds must not contain duplicates")
+                seen.Add(itemId)
+                selected.Append(Me.mWorkspace.ReadItem(itemId))
+            Next
+        Else
+            selected = Me.mWorkspace.Items()
+        End If
+        Dim matches As JSONItem = JSONItem.NewArray()
+        Dim truncated As Boolean = False
+        Dim scannedBytes As Integer = 0
+        Dim scannedItems As Integer = 0
+        For Each item As ProjectItem In selected
+            Dim itemBytes As Integer = String.LenBytes(item.Text)
+            If scannedItems >= 256 Or scannedBytes + itemBytes > 33554432 Then
+                truncated = True
+                Exit For
+            End If
+            scannedItems += 1
+            scannedBytes += itemBytes
+            Dim lineByte As Integer = 0
+            Dim lines As Array Of String = String.Split(item.Text, "\n")
+            For lineIndex As Integer = 0 To Array.Count(lines) - 1
+                Dim line As String = lines(lineIndex)
+                Dim position As Integer = 0
+                While position <= String.Len(line)
+                    Dim found As Integer = String.IndexOf(line, query, position, caseSensitive)
+                    If found < 0 Then Exit While
+                    If matches.Count() >= maximum Then
+                        truncated = True
+                        Exit While
+                    End If
+                    Dim startByte As Integer = lineByte + String.LenBytes(String.Left(line, found))
+                    Dim endByte As Integer = startByte + String.LenBytes(String.Substring(line, found, String.Len(query)))
+                    Dim match As JSONItem = JSONItem.NewObject()
+                    match.Value("itemId") = item.Id
+                    match.Value("path") = item.RelativePath
+                    match.Value("version") = NumberJSON(item.Version)
+                    match.Value("line") = NumberJSON(lineIndex + 1)
+                    match.Value("startByte") = NumberJSON(startByte)
+                    match.Value("endByte") = NumberJSON(endByte)
+                    match.Value("preview") = String.Substring(line, Math.Max(0, found - 80), 240)
+                    matches.Add(match)
+                    position = found + Math.Max(1, String.Len(query))
+                End While
+                If truncated Then Exit For
+                lineByte += String.LenBytes(line) + 1
+            Next
+            If truncated Then Exit For
+        Next
+        Dim payload As JSONItem = JSONItem.NewObject()
+        payload.Value("matches") = matches
+        payload.Value("truncated") = truncated
+        payload.Value("offsetEncoding") = "utf-8"
+        payload.Value("scannedItems") = NumberJSON(scannedItems)
+        Return payload
+    End Function
+
+    Private Function Tools() As JSONItem
+        Dim tools As JSONItem = JSONItem.NewArray()
+        Dim listTool As JSONItem = JSONItem.NewObject()
+        listTool.Value("name") = "project_list_items"
+        listTool.Value("description") = "List registered project items and their current in-memory revisions."
+        listTool.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}")
+        Dim annotations As JSONItem = Json.Parse("{\"readOnlyHint\":true,\"openWorldHint\":false}")
+        listTool.Value("annotations") = annotations
+        tools.Add(listTool)
+        Dim workspaceTool As JSONItem = JSONItem.NewObject()
+        workspaceTool.Value("name") = "project_workspace"
+        workspaceTool.Value("description") = "Describe registered buffer count, unsaved count and available actions. Authority is registered buffers; edits use undoable proposals, applied automatically only when the user enables auto-allow. Saving and execution are unavailable through project tools."
+        workspaceTool.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}")
+        workspaceTool.Value("annotations") = annotations
+        tools.Add(workspaceTool)
+        Dim statusTool As JSONItem = JSONItem.NewObject()
+        statusTool.Value("name") = "project_proposal_status"
+        statusTool.Value("description") = "Read pending, stale, applied or rejected proposal state and item revisions. Applied resultingVersion records the revision produced by approval. Summaries omit buffer text and are bounded; truncated reports omitted change metadata."
+        statusTool.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{\"proposalId\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512}},\"required\":[\"proposalId\"],\"additionalProperties\":false}")
+        statusTool.Value("annotations") = annotations
+        tools.Add(statusTool)
+        Dim readTool As JSONItem = JSONItem.NewObject()
+        readTool.Value("name") = "project_read_item"
+        readTool.Value("description") = "Read the authoritative unsaved buffer and revision. Optional 1-based startLine/maxLines returns a bounded range with absolute UTF-8 byte offsets."
+        readTool.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{\"itemId\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512},\"startLine\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":10000000},\"maxLines\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":2000}},\"required\":[\"itemId\"],\"additionalProperties\":false}")
+        readTool.Value("annotations") = annotations
+        tools.Add(readTool)
+        Dim searchTool As JSONItem = JSONItem.NewObject()
+        searchTool.Value("name") = "project_search"
+        searchTool.Value("description") = "Search literal single-line text in registered authoritative unsaved buffers. Results include revision, 1-based line and absolute UTF-8 byte offsets. At most 100 results, 256 items and 32 MiB scanned; previews are bounded."
+        searchTool.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":1024},\"caseSensitive\":{\"type\":\"boolean\"},\"itemIds\":{\"type\":\"array\",\"maxItems\":256,\"uniqueItems\":true,\"items\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":512}},\"maxResults\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100,\"default\":20}},\"required\":[\"query\"],\"additionalProperties\":false}")
+        searchTool.Value("annotations") = annotations
+        tools.Add(searchTool)
+        Dim editTool As JSONItem = JSONItem.NewObject()
+        editTool.Value("name") = "project_propose_edits"
+        editTool.Value("description") = "Prepare UTF-8 byte edits against exact item revisions. Returns a bounded proposal summary without full buffers. Changes enter shared undo/redo history after host approval or user-enabled auto-allow; inspect returned status and use project_proposal_status for approval or staleness."
+        editTool.Value("inputSchema") = Json.Parse("{\"type\":\"object\",\"properties\":{\"changes\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":256,\"items\":{\"type\":\"object\",\"properties\":{\"itemId\":{\"type\":\"string\"},\"expectedVersion\":{\"type\":\"integer\",\"minimum\":1},\"edits\":{\"type\":\"array\",\"maxItems\":4096,\"items\":{\"type\":\"object\",\"properties\":{\"startByte\":{\"type\":\"integer\",\"minimum\":0},\"endByte\":{\"type\":\"integer\",\"minimum\":0},\"text\":{\"type\":\"string\"}},\"required\":[\"startByte\",\"endByte\",\"text\"],\"additionalProperties\":false}}},\"required\":[\"itemId\",\"expectedVersion\",\"edits\"],\"additionalProperties\":false}}},\"required\":[\"changes\"],\"additionalProperties\":false}")
+        editTool.Value("annotations") = Json.Parse("{\"readOnlyHint\":false,\"destructiveHint\":false,\"openWorldHint\":false}")
+        tools.Add(editTool)
+        Dim extensions As JSONItem = Me.ExtensionTools()
+        For i As Integer = 0 To extensions.Count() - 1
+            tools.Add(extensions.ValueAt(i))
+        Next
+        Dim value As JSONItem = JSONItem.NewObject()
+        Dim enabled As JSONItem = JSONItem.NewArray()
+        For i As Integer = 0 To tools.Count() - 1
+            If Me.Access.Allows(tools.ValueAt(i).Value("name").AsString().Or("")) Then enabled.Add(tools.ValueAt(i))
+        Next
+        value.Value("tools") = enabled
+        Return value
+    End Function
+
+    Private Function CallTool(arguments As JSONItem) As JSONItem
+        RequireKeys(arguments, ["name", "arguments", "_meta"])
+        Dim name As String = ReadString(arguments, "name")
+        If Not Me.Access.Allows(name) Then Throw New InvalidArgumentException("Tool disabled by host: " + name)
+        Dim input As JSONItem = JSONItem.NewObject()
+        If arguments.HasKey("arguments") Then input = arguments.Value("arguments")
+        Dim payload As JSONItem
+        If SameText(name, "project_workspace") Then
+                Dim noKeys As Array Of String = []
+                RequireKeys(input, noKeys)
+                payload = Me.WorkspaceJSON()
+        ElseIf SameText(name, "project_proposal_status") Then
+                RequireKeys(input, ["proposalId"])
+                Dim proposalId As String = ReadString(input, "proposalId")
+                RequireName(proposalId, "proposal id")
+                Try
+                    payload = Me.ProposalSummary(Me.mWorkspace.ReadProposal(proposalId))
+                Catch e As InvalidArgumentException
+                    Return ToolContent(JSONItem.From(e.Message), True)
+                End Try
+        ElseIf SameText(name, "project_list_items") Then
+                Dim noKeys As Array Of String = []
+                RequireKeys(input, noKeys)
+                payload = JSONItem.NewObject()
+                Dim items As JSONItem = JSONItem.NewArray()
+                For Each item As ProjectItem In Me.mWorkspace.Items()
+                    items.Add(ItemJSON(item, False))
+                Next
+                payload.Value("items") = items
+        ElseIf SameText(name, "project_read_item") Then
+                RequireKeys(input, ["itemId", "startLine", "maxLines"])
+                Dim itemId As String = ReadString(input, "itemId")
+                RequireId(itemId)
+                Dim startLine As Integer = BoundedInteger(input, "startLine", 1, 1, 10000000)
+                Dim maxLines As Integer = BoundedInteger(input, "maxLines", 200, 1, 2000)
+                Try
+                    Dim item As ProjectItem = Me.mWorkspace.ReadItem(itemId)
+                    If input.HasKey("startLine") Or input.HasKey("maxLines") Then
+                        payload = RangedItemJSON(item, startLine, maxLines)
+                    Else
+                        payload = ItemJSON(item, True)
+                    End If
+                Catch e As InvalidArgumentException
+                    Return ToolContent(JSONItem.From(e.Message), True)
+                End Try
+        ElseIf SameText(name, "project_search") Then
+                payload = Me.Search(input)
+        ElseIf SameText(name, "project_propose_edits") Then
+                RequireKeys(input, ["changes"])
+                Dim changes As JSONItem = input.Value("changes")
+                If Not changes.IsArray() Then Throw New InvalidArgumentException("changes must be an array")
+                If changes.Count() < 1 Or changes.Count() > 256 Then Throw New InvalidArgumentException("changes must contain 1..256 items")
+                Dim requests As Array Of ProjectChangeRequest = []
+                For i As Integer = 0 To changes.Count() - 1
+                    Dim change As JSONItem = changes.ValueAt(i)
+                    RequireKeys(change, ["itemId", "expectedVersion", "edits"])
+                    Dim editsValue As JSONItem = change.Value("edits")
+                    If Not editsValue.IsArray() Or editsValue.Count() > 4096 Then Throw New InvalidArgumentException("edits must be an array of at most 4096 edits")
+                    Dim edits As Array Of EditorEdit = []
+                    For j As Integer = 0 To editsValue.Count() - 1
+                        Dim editValue As JSONItem = editsValue.ValueAt(j)
+                        RequireKeys(editValue, ["startByte", "endByte", "text"])
+                        Array.Append(edits, New EditorEdit(ReadInteger(editValue, "startByte"), ReadInteger(editValue, "endByte"), ReadString(editValue, "text")))
+                    Next
+                    Array.Append(requests, New ProjectChangeRequest(ReadString(change, "itemId"), ReadInteger(change, "expectedVersion"), edits))
+                Next
+                Try
+                    payload = Me.ProposalSummary(Me.mWorkspace.ProposeAgentEdits(requests))
+                Catch e As Exception
+                    Return ToolContent(JSONItem.From(e.Message), True)
+                End Try
+        Else
+                Dim descriptors As JSONItem = Me.ExtensionTools()
+                Dim recognized As Boolean = False
+                For i As Integer = 0 To descriptors.Count() - 1
+                    If SameText(ReadString(descriptors.ValueAt(i), "name"), name) Then recognized = True
+                Next
+                If Not recognized Then Throw New InvalidArgumentException("Unknown project tool")
+                If Not input.IsObject() Then Throw New InvalidArgumentException("Tool arguments must be an object")
+                payload = Me.Extension.Call(name, input)
+        End If
+        Return ToolContent(payload, False)
+    End Function
+
+    Private Function Resources() As JSONItem
+        Dim resources As JSONItem = JSONItem.NewArray()
+        For Each item As ProjectItem In Me.mWorkspace.Items()
+            If Not Me.Access.ResourcesEnabled Then Exit For
+            Dim resource As JSONItem = JSONItem.NewObject()
+            resource.Value("uri") = item.ResourceUri
+            resource.Value("name") = item.RelativePath
+            resource.Value("description") = "Current in-memory project item: " + item.Kind
+            resource.Value("mimeType") = "text/plain"
+            resources.Add(resource)
+        Next
+        Dim value As JSONItem = JSONItem.NewObject()
+        value.Value("resources") = resources
+        Return value
+    End Function
+
+    Private Function ReadResource(arguments As JSONItem) As JSONItem
+        If Not Me.Access.ResourcesEnabled Then Throw New InvalidArgumentException("Project resources disabled by host")
+        RequireKeys(arguments, ["uri", "_meta"])
+        Dim uri As String = ReadString(arguments, "uri")
+        Dim prefix As String = "buoy-project://item/"
+        If Not String.StartsWith(uri, prefix, True) Then Throw New InvalidArgumentException("Unknown project resource URI")
+        Dim item As ProjectItem = Me.mWorkspace.ReadItem(String.Substring(uri, String.Len(prefix)))
+        Dim content As JSONItem = JSONItem.NewObject()
+        content.Value("uri") = item.ResourceUri
+        content.Value("mimeType") = "text/plain"
+        content.Value("text") = item.Text
+        Dim contents As JSONItem = JSONItem.NewArray()
+        contents.Add(content)
+        Dim value As JSONItem = JSONItem.NewObject()
+        value.Value("contents") = contents
+        Return value
+    End Function
+
+    Public Function Handle(message As JSONItem) As JSONItem
+        Dim requestId As JSONItem = JSONItem.Null()
+        If message = Nil Then Return Failure(requestId, -32600, "Invalid request")
+        If Not message.IsObject() Then Return Failure(requestId, -32600, "Invalid request")
+        If message.HasKey("id") Then
+            If Not ValidRequestId(message.Value("id")) Then Return Failure(requestId, -32600, "Invalid request id")
+            requestId = message.Value("id")
+        End If
+        If Not SameText(message.Value("jsonrpc").AsString().Or(""), "2.0") Or Not message.Value("method").IsString() Or message.HasKey("result") Or message.HasKey("error") Then
+            If Not message.HasKey("id") Then Return Nil
+            Return Failure(requestId, -32600, "Invalid request")
+        End If
+        Dim methodName As String = message.Value("method").AsString().Value
+        If Not message.HasKey("id") Then
+            If SameText(methodName, "notifications/initialized") And Me.mStage = 1 Then Me.mStage = 2
+            Return Nil
+        End If
+        Dim arguments As JSONItem = JSONItem.NewObject()
+        If message.HasKey("params") Then arguments = message.Value("params")
+        Try
+            If Not arguments.IsObject() Then Throw New InvalidArgumentException("params must be an object")
+            If SameText(methodName, "initialize") Then
+                    If Me.mStage <> 0 Then Return Failure(requestId, -32600, "Already initialized")
+                    RequireKeys(arguments, ["protocolVersion", "clientInfo", "capabilities", "_meta"])
+                    Dim requested As String = ReadString(arguments, "protocolVersion")
+                    If Not arguments.Value("capabilities").IsObject() Then Throw New InvalidArgumentException("Client capabilities are required")
+                    Dim clientInfo As JSONItem = arguments.Value("clientInfo")
+                    If Not clientInfo.IsObject() Then Throw New InvalidArgumentException("Client information is required")
+                    ReadString(clientInfo, "name")
+                    ReadString(clientInfo, "version")
+                    If requested = "2025-11-25" Or requested = "2025-06-18" Or requested = "2025-03-26" Then Me.mProtocol = requested
+                    Dim payload As JSONItem = JSONItem.NewObject()
+                    payload.Value("protocolVersion") = Me.mProtocol
+                    payload.Value("capabilities") = Json.Parse("{\"tools\":{},\"resources\":{}}")
+                    payload.Value("serverInfo") = Json.Parse("{\"name\":\"buoy-projectkit\",\"version\":\"0.1.0\"}")
+                    payload.Value("instructions") = "Project tools operate on registered unsaved buffers. Edit proposals require host approval unless the user enabled auto-allow. Applied edits enter shared undo/redo history. Read project_workspace for the current policy."
+                    Me.mStage = 1
+                    Return Reply(requestId, payload)
+            ElseIf SameText(methodName, "ping") Then
+                Return Reply(requestId, JSONItem.NewObject())
+            End If
+            If Not SameText(methodName, "tools/list") And Not SameText(methodName, "resources/list") And Not SameText(methodName, "tools/call") And Not SameText(methodName, "resources/read") Then Return Failure(requestId, -32601, "Method not found")
+            If Me.mStage <> 2 Then Return Failure(requestId, -32002, "MCP session is not initialized")
+            If SameText(methodName, "tools/list") Or SameText(methodName, "resources/list") Then
+                    RequireKeys(arguments, ["cursor", "_meta"])
+                    If arguments.HasKey("cursor") Then
+                        If Not arguments.Value("cursor").IsString() Then Throw New InvalidArgumentException("Invalid pagination cursor")
+                        If arguments.Value("cursor").AsString().Value <> "" Then Throw New InvalidArgumentException("Invalid pagination cursor")
+                    End If
+                    If SameText(methodName, "tools/list") Then Return Reply(requestId, Me.Tools())
+                    Return Reply(requestId, Me.Resources())
+            ElseIf SameText(methodName, "tools/call") Then
+                    Return Reply(requestId, Me.CallTool(arguments))
+            ElseIf SameText(methodName, "resources/read") Then
+                    Return Reply(requestId, Me.ReadResource(arguments))
+            Else
+                Return Failure(requestId, -32601, "Method not found")
+            End If
+        Catch e As Exception
+            Return Failure(requestId, -32602, e.Message)
+        End Try
+    End Function
+End Class

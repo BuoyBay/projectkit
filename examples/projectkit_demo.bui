@@ -1,0 +1,17 @@
+Import editorkit
+Import projectkit
+
+Sub Main()
+    Dim workspace As New ProjectWorkspace()
+    workspace.RegisterItem("main", "src/main.bui", "source", "Print \"Hello\"\n")
+    Dim item As ProjectItem = workspace.ReadItem("main")
+    Dim edits As Array Of EditorEdit = [New EditorEdit(7, 12, "Buoy Studio")]
+    Dim requests As Array Of ProjectChangeRequest = [New ProjectChangeRequest(item.Id, item.Version, edits)]
+    Dim proposal As ProjectProposal = workspace.Propose(requests)
+    Print Json.Stringify(ProposalJSON(proposal))
+    ' The application displays the preview before explicitly applying the proposal.
+    workspace.ApproveProposal(proposal.Id)
+    Print workspace.ReadItem("main").Text
+    workspace.Undo("main")
+    Print "Undo restored: " + workspace.ReadItem("main").Text
+End Sub
