@@ -2,5 +2,5 @@
   "schema": 1,
   "name": "projectkit",
   "version": "0.1.0",
-  "description": "Revisioned project items, atomic reviewed edit proposals and MCP project resources/tools; requires editorkit"
+  "description": "Project buffers and reviewed edit proposals"
 }

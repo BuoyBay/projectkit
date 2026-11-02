@@ -1,4 +1,4 @@
-# Manage project buffers and reviewed edit proposals
+# Project buffers and reviewed edit proposals
 
 An in-memory project model that gives agents the same project items and unsaved
 buffers an editor sees. It combines stable item identities, monotonic revisions,
@@ -23,7 +23,7 @@ BPM also resolves `editorkit`.
 
 ## Example
 
-```buoy
+```basic
 Import editorkit
 Import projectkit
 
