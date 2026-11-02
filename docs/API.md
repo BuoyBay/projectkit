@@ -121,9 +121,3 @@ Limits are 4096 registered items, 8 MiB UTF-8 text per item, 256 retained propos
 text snapshots and proposals retain old/new text, so applications should choose a
 history limit and proposal retention policy suitable for their project sizes.
 Confine each workspace and MCP host to one thread or synchronize externally.
-
-## Verification
-
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
