@@ -2,5 +2,5 @@
   "schema": 1,
   "name": "projectkit",
   "version": "0.1.0",
-  "description": "Project buffers and reviewed edit proposals"
+  "description": "Project buffers and edits"
 }
